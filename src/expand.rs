@@ -1,3 +1,5 @@
+use crate::allocator::{self, AllocatorAttr, AllocatorSource};
+use crate::args::Args;
 use crate::bound::{has_bound, InferredBound, Supertraits};
 use crate::lifetime::{AddLifetimeToImplTrait, CollectLifetimes};
 use crate::parse::Item;
@@ -53,7 +55,7 @@ impl Context<'_> {
     }
 }
 
-pub fn expand(input: &mut Item, is_local: bool) {
+pub fn expand(input: &mut Item, args: &Args) {
     match input {
         Item::Trait(input) => {
             let context = Context::Trait {
@@ -64,18 +66,34 @@ pub fn expand(input: &mut Item, is_local: bool) {
                 if let TraitItem::Fn(method) = inner {
                     let sig = &mut method.sig;
                     if sig.asyncness.is_some() {
+                        let (send_override, mut method_alloc) =
+                            extract_method_config(&mut method.attrs);
+                        if method_alloc.is_none() {
+                            method_alloc = extract_param_alloc(sig);
+                        }
+                        let is_local = method_is_local(args.is_send, send_override);
+                        let effective_alloc =
+                            method_alloc.as_ref().or(args.allocator.as_ref());
+
                         let block = &mut method.default;
                         let mut has_self = has_self_in_sig(sig);
                         method.attrs.push(parse_quote!(#[must_use]));
                         if let Some(block) = block {
                             has_self |= has_self_in_block(block);
-                            transform_block(context, sig, block);
+                            transform_block(context, sig, block, effective_alloc);
                             method.attrs.push(lint_suppress_with_body());
                         } else {
                             method.attrs.push(lint_suppress_without_body());
                         }
                         let has_default = method.default.is_some();
-                        transform_sig(context, sig, has_self, has_default, is_local);
+                        transform_sig(
+                            context,
+                            sig,
+                            has_self,
+                            has_default,
+                            is_local,
+                            effective_alloc,
+                        );
                     }
                 }
             }
@@ -100,8 +118,25 @@ pub fn expand(input: &mut Item, is_local: bool) {
                         let sig = &mut method.sig;
                         let block = &mut method.block;
                         let has_self = has_self_in_sig(sig);
-                        transform_block(context, sig, block);
-                        transform_sig(context, sig, has_self, false, is_local);
+
+                        let (send_override, mut method_alloc) =
+                            extract_method_config(&mut method.attrs);
+                        if method_alloc.is_none() {
+                            method_alloc = extract_param_alloc(sig);
+                        }
+                        let is_local = method_is_local(args.is_send, send_override);
+                        let effective_alloc =
+                            method_alloc.as_ref().or(args.allocator.as_ref());
+
+                        transform_block(context, sig, block, effective_alloc);
+                        transform_sig(
+                            context,
+                            sig,
+                            has_self,
+                            false,
+                            is_local,
+                            effective_alloc,
+                        );
                         method.attrs.push(lint_suppress_with_body());
                     }
                     ImplItem::Verbatim(tokens) => {
@@ -111,7 +146,19 @@ pub fn expand(input: &mut Item, is_local: bool) {
                         };
                         let sig = &mut method.sig;
                         let has_self = has_self_in_sig(sig);
-                        transform_sig(context, sig, has_self, false, is_local);
+
+                        // Verbatim items have no attrs vec to extract from, use defaults.
+                        let is_local = !args.is_send;
+                        let effective_alloc = args.allocator.as_ref();
+
+                        transform_sig(
+                            context,
+                            sig,
+                            has_self,
+                            false,
+                            is_local,
+                            effective_alloc,
+                        );
                         method.attrs.push(lint_suppress_with_body());
                         *tokens = quote!(#method);
                     }
@@ -121,6 +168,104 @@ pub fn expand(input: &mut Item, is_local: bool) {
         }
     }
 }
+
+// ── Per-method configuration extraction ─────────────────────────────────────
+
+/// Resolve whether a specific method should be local (no Send) given the trait-level default
+/// and an optional per-method override.
+fn method_is_local(trait_is_send: bool, send_override: Option<bool>) -> bool {
+    !send_override.unwrap_or(trait_is_send)
+}
+
+/// Extract and strip per-method `#[async_trait(Send)]`, `#[async_trait(?Send)]`, and
+/// `#[allocator(...)]` attributes from `attrs`.
+///
+/// Returns `(send_override, method_alloc)` where:
+/// - `send_override` is `Some(true)` for `#[async_trait(Send)]`,
+///   `Some(false)` for `#[async_trait(?Send)]`, `None` if absent.
+/// - `method_alloc` is the parsed `AllocatorAttr` if present.
+fn extract_method_config(
+    attrs: &mut Vec<Attribute>,
+) -> (Option<bool>, Option<AllocatorAttr>) {
+    let mut send_override: Option<bool> = None;
+    let mut method_alloc: Option<AllocatorAttr> = None;
+
+    let old = mem::take(attrs);
+    *attrs = old
+        .into_iter()
+        .filter(|attr| {
+            // `#[async_trait(Send)]` or `#[async_trait(?Send)]` on the method
+            if attr.path().is_ident("async_trait") {
+                if let Ok(arg) = attr.parse_args::<MethodSendArg>() {
+                    send_override = Some(arg.is_send);
+                    return false;
+                }
+            }
+            // `#[allocator(Type => expr)]` or `#[allocator(unsafe, Type => expr)]`
+            if let Some(alloc) = allocator::try_method_alloc(attr) {
+                method_alloc = Some(alloc);
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    (send_override, method_alloc)
+}
+
+/// Scan `sig.inputs` for a parameter annotated with `#[allocator]` or `#[allocator(unsafe)]`.
+/// Strips the attribute from the parameter and returns the corresponding `AllocatorAttr`.
+fn extract_param_alloc(sig: &mut Signature) -> Option<AllocatorAttr> {
+    for arg in sig.inputs.iter_mut() {
+        if let FnArg::Typed(typed) = arg {
+            let mut found: Option<bool> = None;
+            let old_attrs = mem::take(&mut typed.attrs);
+            typed.attrs = old_attrs
+                .into_iter()
+                .filter(|attr| {
+                    if let Some(is_unsafe) = allocator::try_param_alloc_marker(attr) {
+                        found = Some(is_unsafe);
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+
+            if let Some(is_unsafe) = found {
+                if let Pat::Ident(PatIdent { ident, .. }) = &*typed.pat {
+                    return Some(AllocatorAttr {
+                        is_unsafe,
+                        source: AllocatorSource::Param {
+                            ty: (*typed.ty).clone(),
+                            ident: ident.clone(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Minimal parser for the `Send` / `?Send` argument inside `#[async_trait(...)]` on a method.
+struct MethodSendArg {
+    is_send: bool,
+}
+
+impl syn::parse::Parse for MethodSendArg {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.peek(Token![?]) {
+            input.parse::<Token![?]>()?;
+            input.parse::<crate::args::kw::Send>()?;
+            Ok(MethodSendArg { is_send: false })
+        } else {
+            input.parse::<crate::args::kw::Send>()?;
+            Ok(MethodSendArg { is_send: true })
+        }
+    }
+}
+
+// ── Lint suppression attributes ──────────────────────────────────────────────
 
 fn lint_suppress_with_body() -> Attribute {
     parse_quote! {
@@ -149,25 +294,31 @@ fn lint_suppress_without_body() -> Attribute {
     }
 }
 
+// ── Signature transformation ─────────────────────────────────────────────────
+
 // Input:
 //     async fn f<T>(&self, x: &T) -> Ret;
 //
-// Output:
+// Output (no Send, no custom allocator):
 //     fn f<'life0, 'life1, 'async_trait, T>(
 //         &'life0 self,
 //         x: &'life1 T,
-//     ) -> Pin<Box<dyn Future<Output = Ret> + Send + 'async_trait>>
+//     ) -> Pin<Box<dyn Future<Output = Ret> + 'async_trait>>
 //     where
 //         'life0: 'async_trait,
 //         'life1: 'async_trait,
 //         T: 'async_trait,
-//         Self: Sync + 'async_trait;
+//         Self: 'async_trait;
+//
+// With Send + custom allocator:
+//     -> Pin<Box<dyn Future<Output = Ret> + Send + 'async_trait, MyAlloc>>
 fn transform_sig(
     context: Context,
     sig: &mut Signature,
     has_self: bool,
     has_default: bool,
     is_local: bool,
+    alloc: Option<&AllocatorAttr>,
 ) {
     sig.fn_token.span = sig.asyncness.take().unwrap().span;
 
@@ -321,19 +472,33 @@ fn transform_sig(
     } else {
         quote!(::core::marker::Send + 'async_trait)
     };
-    sig.output = parse_quote! {
-        #ret_arrow ::core::pin::Pin<Box<
-            dyn ::core::future::Future<Output = #ret> + #bounds
-        >>
+
+    sig.output = match alloc {
+        None => parse_quote! {
+            #ret_arrow ::core::pin::Pin<Box<
+                dyn ::core::future::Future<Output = #ret> + #bounds
+            >>
+        },
+        Some(a) => {
+            let alloc_ty = a.ty();
+            parse_quote! {
+                #ret_arrow ::core::pin::Pin<::std::boxed::Box<
+                    dyn ::core::future::Future<Output = #ret> + #bounds,
+                    #alloc_ty
+                >>
+            }
+        }
     };
 }
+
+// ── Block transformation ─────────────────────────────────────────────────────
 
 // Input:
 //     async fn f<T>(&self, x: &T, (a, b): (A, B)) -> Ret {
 //         self + x + a + b
 //     }
 //
-// Output:
+// Output (no allocator):
 //     Box::pin(async move {
 //         let ___ret: Ret = {
 //             let __self = self;
@@ -345,7 +510,28 @@ fn transform_sig(
 //
 //         ___ret
 //     })
-fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
+//
+// Output (with allocator `MyAlloc => MyAlloc::new()`):
+//     {
+//         let __pin_allocator = MyAlloc::new();
+//         Box::pin_in(async move { ... }, __pin_allocator)
+//     }
+fn transform_block(
+    context: Context,
+    sig: &mut Signature,
+    block: &mut Block,
+    alloc: Option<&AllocatorAttr>,
+) {
+    // For a Param allocator, the parameter must NOT be re-bound inside the async block
+    // (it gets consumed before the block via __pin_allocator).
+    let alloc_param_ident: Option<&Ident> = alloc.and_then(|a| {
+        if let AllocatorSource::Param { ident, .. } = &a.source {
+            Some(ident)
+        } else {
+            None
+        }
+    });
+
     let mut replace_self = false;
     let decls = sig
         .inputs
@@ -364,8 +550,6 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
             FnArg::Typed(arg) => {
                 // If there is a #[cfg(...)] attribute that selectively enables
                 // the parameter, forward it to the variable.
-                //
-                // This is currently not applied to the `self` parameter.
                 let attrs = arg.attrs.iter().filter(|attr| attr.path().is_ident("cfg"));
 
                 if let Type::Reference(_) = *arg.ty {
@@ -374,6 +558,11 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
                     ident, mutability, ..
                 }) = &*arg.pat
                 {
+                    // Skip re-binding the allocator parameter: it is consumed before
+                    // the async block.
+                    if alloc_param_ident == Some(ident) {
+                        return quote!();
+                    }
                     quote! {
                         #(#attrs)*
                         let #mutability #ident = #ident;
@@ -433,11 +622,37 @@ fn transform_block(context: Context, sig: &mut Signature, block: &mut Block) {
             }
         }
     };
-    let box_pin = quote_spanned!(sig.asyncness.unwrap().span=>
-        Box::pin(async move { #let_ret })
-    );
+
+    let span = sig.asyncness.unwrap().span;
+
+    let box_pin = match alloc {
+        None => {
+            quote_spanned!(span=> Box::pin(async move { #let_ret }))
+        }
+        Some(a) => {
+            let alloc_expr = a.expr_tokens();
+            if a.is_unsafe {
+                quote_spanned!(span=> {
+                    let __pin_allocator = #alloc_expr;
+                    unsafe {
+                        ::core::pin::Pin::new_unchecked(
+                            ::std::boxed::Box::new_in(async move { #let_ret }, __pin_allocator)
+                        )
+                    }
+                })
+            } else {
+                quote_spanned!(span=> {
+                    let __pin_allocator = #alloc_expr;
+                    ::std::boxed::Box::pin_in(async move { #let_ret }, __pin_allocator)
+                })
+            }
+        }
+    };
+
     block.stmts = parse_quote!(#box_pin);
 }
+
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 fn positional_arg(i: usize, pat: &Pat) -> Ident {
     let span = syn::spanned::Spanned::span(pat).resolved_at(Span::mixed_site());

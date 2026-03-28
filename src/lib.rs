@@ -134,7 +134,7 @@
 //! # Explanation
 //!
 //! Async fns get transformed into methods that return `Pin<Box<dyn Future +
-//! Send + 'async_trait>>` and delegate to an async block.
+//! 'async_trait>>` and delegate to an async block.
 //!
 //! For example the `impl Advertisement for AutoplayingVideo` above would be
 //! expanded as:
@@ -144,9 +144,9 @@
 //! impl Advertisement for AutoplayingVideo {
 //!     fn run<'async_trait>(
 //!         &'async_trait self,
-//!     ) -> Pin<Box<dyn core::future::Future<Output = ()> + Send + 'async_trait>>
+//!     ) -> Pin<Box<dyn core::future::Future<Output = ()> + 'async_trait>>
 //!     where
-//!         Self: Sync + 'async_trait,
+//!         Self: 'async_trait,
 //!     {
 //!         Box::pin(async move {
 //!             /* the original method body */
@@ -158,12 +158,21 @@
 //!
 //! <br><br>
 //!
-//! # Non-threadsafe futures
+//! # Threadsafe futures
 //!
-//! Not all async traits need futures that are `dyn Future + Send`. To avoid
-//! having Send and Sync bounds placed on the async trait methods, invoke the
-//! async trait macro as `#[async_trait(?Send)]` on both the trait and the impl
-//! blocks.
+//! By default the returned future has no `Send` bound, matching Rust's native
+//! async-fn-in-traits behaviour. To opt an entire trait into `+ Send` futures,
+//! use `#[async_trait(Send)]`. Individual methods can be opted in or out with
+//! `#[async_trait(Send)]` / `#[async_trait(?Send)]` placed directly on the
+//! method inside the trait or impl block.
+//!
+//! ```
+//! # use async_trait::async_trait;
+//! #[async_trait(Send)]
+//! trait SendTrait {
+//!     async fn must_be_send(&self);
+//! }
+//! ```
 //!
 //! <br>
 //!
@@ -235,6 +244,7 @@
 extern crate proc_macro;
 
 mod args;
+mod allocator;
 mod bound;
 mod expand;
 mod lifetime;
@@ -253,6 +263,6 @@ use syn::parse_macro_input;
 pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    expand(&mut item, args.local);
+    expand(&mut item, &args);
     TokenStream::from(quote!(#item))
 }

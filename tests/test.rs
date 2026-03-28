@@ -1,6 +1,6 @@
 #![cfg_attr(
     async_trait_nightly_testing,
-    feature(impl_trait_in_assoc_type, min_specialization, never_type)
+    feature(allocator_api, impl_trait_in_assoc_type, min_specialization, never_type)
 )]
 #![deny(rust_2021_compatibility, unused_qualifications)]
 #![allow(
@@ -1725,5 +1725,167 @@ pub mod issue288 {
         async fn g<#[cfg(all())] T: Send>(#[cfg(all())] t: T) {
             let _ = t;
         }
+    }
+}
+
+// ── Per-method Send ──────────────────────────────────────────────────────────
+
+pub mod per_method_send {
+    use async_trait::async_trait;
+
+    // Default is no-Send. Opt individual methods into Send.
+    #[async_trait]
+    trait MixedSend {
+        // inherits default: no Send
+        async fn local(&self) -> u32;
+
+        // explicitly opted into Send
+        #[async_trait(Send)]
+        async fn send_method(&self) -> u32;
+    }
+
+    struct S;
+
+    #[async_trait]
+    impl MixedSend for S {
+        async fn local(&self) -> u32 {
+            1
+        }
+
+        #[async_trait(Send)]
+        async fn send_method(&self) -> u32 {
+            2
+        }
+    }
+
+    // Trait-level Send, then one method opts out.
+    #[async_trait(Send)]
+    trait SendTraitWithLocal {
+        async fn always_send(&self) -> u32;
+
+        #[async_trait(?Send)]
+        async fn local_override(&self) -> u32;
+    }
+
+    #[async_trait(Send)]
+    impl SendTraitWithLocal for S {
+        async fn always_send(&self) -> u32 {
+            3
+        }
+
+        #[async_trait(?Send)]
+        async fn local_override(&self) -> u32 {
+            4
+        }
+    }
+
+    #[test]
+    fn test() {
+        futures::executor::block_on(async {
+            let s = S;
+            assert_eq!(s.local().await, 1);
+            assert_eq!(s.send_method().await, 2);
+            assert_eq!(s.always_send().await, 3);
+            assert_eq!(s.local_override().await, 4);
+        });
+    }
+}
+
+// ── Custom allocator ─────────────────────────────────────────────────────────
+
+#[cfg(async_trait_nightly_testing)]
+pub mod custom_allocator {
+    use async_trait::async_trait;
+    use std::alloc::Global;
+
+    // Form 1 — explicit type + expression (safe path, A: 'static)
+    #[async_trait]
+    trait ExplicitAlloc {
+        #[allocator(Global => Global)]
+        async fn with_alloc(&self) -> u32;
+
+        async fn without_alloc(&self) -> u32;
+    }
+
+    struct S;
+
+    #[async_trait]
+    impl ExplicitAlloc for S {
+        #[allocator(Global => Global)]
+        async fn with_alloc(&self) -> u32 {
+            10
+        }
+
+        async fn without_alloc(&self) -> u32 {
+            20
+        }
+    }
+
+    // Form 2 — allocator from a method parameter (safe path)
+    #[async_trait]
+    trait ParamAlloc {
+        async fn with_param_alloc(&self, #[allocator] alloc: Global) -> u32;
+    }
+
+    #[async_trait]
+    impl ParamAlloc for S {
+        async fn with_param_alloc(&self, #[allocator] _alloc: Global) -> u32 {
+            30
+        }
+    }
+
+    // Form 3 — trait-level default allocator
+    #[async_trait(allocator(Global => Global))]
+    trait DefaultAlloc {
+        async fn foo(&self) -> u32;
+        async fn bar(&self) -> u32;
+    }
+
+    #[async_trait(allocator(Global => Global))]
+    impl DefaultAlloc for S {
+        async fn foo(&self) -> u32 {
+            40
+        }
+        async fn bar(&self) -> u32 {
+            50
+        }
+    }
+
+    // Form 4 — trait-level default overridden per method
+    #[async_trait(allocator(Global => Global))]
+    trait OverrideAlloc {
+        async fn default_alloc(&self) -> u32;
+
+        // this method overrides the trait-level default
+        async fn no_alloc(&self) -> u32;
+    }
+
+    // In the impl the override method can drop the attribute; the macro
+    // applies the trait-level allocator to `default_alloc` and plain Box::pin
+    // is used for `no_alloc` when the impl doesn't carry its own #[allocator].
+    // To test the override: the impl for `no_alloc` simply omits #[allocator].
+    #[async_trait(allocator(Global => Global))]
+    impl OverrideAlloc for S {
+        async fn default_alloc(&self) -> u32 {
+            60
+        }
+
+        async fn no_alloc(&self) -> u32 {
+            70
+        }
+    }
+
+    #[test]
+    fn test() {
+        futures::executor::block_on(async {
+            let s = S;
+            assert_eq!(s.with_alloc().await, 10);
+            assert_eq!(s.without_alloc().await, 20);
+            assert_eq!(s.with_param_alloc(Global).await, 30);
+            assert_eq!(s.foo().await, 40);
+            assert_eq!(s.bar().await, 50);
+            assert_eq!(s.default_alloc().await, 60);
+            assert_eq!(s.no_alloc().await, 70);
+        });
     }
 }
