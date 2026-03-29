@@ -12,9 +12,9 @@ pub struct AllocatorAttr {
 
 #[derive(Clone)]
 pub enum AllocatorSource {
-    /// `#[allocator(Type => expr)]` or `#[allocator(unsafe, Type => expr)]` on the method.
+    /// `#[allocator(Type => expr)]` or `#[unsafe(allocator(Type => expr))]` on the method.
     Explicit { ty: Type, expr: Expr },
-    /// `#[allocator]` or `#[allocator(unsafe)]` on a function parameter.
+    /// `#[allocator]` or `#[unsafe(allocator)]` on a function parameter.
     /// The type and identifier are inferred from the parameter itself.
     Param { ty: Type, ident: Ident },
 }
@@ -41,79 +41,84 @@ impl AllocatorAttr {
 ///
 /// Recognises:
 /// * `#[allocator(Type => expr)]`          → `is_unsafe = false`
-/// * `#[allocator(unsafe, Type => expr)]`  → `is_unsafe = true`
+/// * `#[unsafe(allocator(Type => expr))]`  → `is_unsafe = true`
+///
+/// The `#[unsafe(...)]` form is stripped by this proc macro before the compiler
+/// validates attribute names, so custom `unsafe(allocator(...))` works fine.
 ///
 /// Returns `None` if the attribute is not an allocator attribute.
 pub fn try_method_alloc(attr: &Attribute) -> Option<AllocatorAttr> {
-    if !attr.path().is_ident("allocator") {
-        return None;
-    }
-    match &attr.meta {
-        // bare `#[allocator]` – that is the parameter-level marker, not a method-level one
-        Meta::Path(_) => None,
-        Meta::List(_) => {
-            let args: ExplicitArgs = attr.parse_args().ok()?;
-            Some(AllocatorAttr {
-                is_unsafe: args.is_unsafe,
-                source: AllocatorSource::Explicit {
-                    ty: args.ty,
-                    expr: args.expr,
-                },
-            })
+    if attr.path().is_ident("allocator") {
+        // #[allocator(Type => expr)] — safe path
+        match &attr.meta {
+            // bare `#[allocator]` – parameter-level marker, not a method-level one
+            Meta::Path(_) => None,
+            Meta::List(_) => {
+                let args: ExplicitArgs = attr.parse_args().ok()?;
+                Some(AllocatorAttr {
+                    is_unsafe: false,
+                    source: AllocatorSource::Explicit { ty: args.ty, expr: args.expr },
+                })
+            }
+            _ => None,
         }
-        _ => None,
+    } else if attr.path().is_ident("unsafe") {
+        // #[unsafe(allocator(Type => expr))] — unsafe path
+        // syn parses `unsafe` as an ident via Ident::parse_any; the proc macro
+        // strips this attribute before the compiler validates the inner name.
+        let inner: Meta = attr.parse_args().ok()?;
+        if let Meta::List(list) = inner {
+            if list.path.is_ident("allocator") {
+                let args: ExplicitArgs = syn::parse2(list.tokens).ok()?;
+                return Some(AllocatorAttr {
+                    is_unsafe: true,
+                    source: AllocatorSource::Explicit { ty: args.ty, expr: args.expr },
+                });
+            }
+        }
+        None
+    } else {
+        None
     }
 }
 
 // ── Parameter-level attribute parsing ───────────────────────────────────────
 
-/// Check whether a parameter attribute is `#[allocator]` or `#[allocator(unsafe)]`.
+/// Check whether a parameter attribute is `#[allocator]` or `#[unsafe(allocator)]`.
 ///
 /// Returns `Some(is_unsafe)` when the attribute is the allocator marker, `None` otherwise.
 pub fn try_param_alloc_marker(attr: &Attribute) -> Option<bool> {
-    if !attr.path().is_ident("allocator") {
-        return None;
-    }
-    match &attr.meta {
-        // `#[allocator]` – safe path
-        Meta::Path(_) => Some(false),
-        // `#[allocator(unsafe)]` – unsafe path
-        Meta::List(_) => {
-            let is_kw: Result<Token![unsafe]> = attr.parse_args();
-            if is_kw.is_ok() {
-                Some(true)
-            } else {
-                // some other form – not a bare unsafe marker
-                None
-            }
+    if attr.path().is_ident("allocator") {
+        // `#[allocator]` – safe path (bare, no args)
+        match &attr.meta {
+            Meta::Path(_) => Some(false),
+            _ => None,
         }
-        _ => None,
+    } else if attr.path().is_ident("unsafe") {
+        // `#[unsafe(allocator)]` – unsafe path
+        let inner: Meta = attr.parse_args().ok()?;
+        match inner {
+            Meta::Path(path) if path.is_ident("allocator") => Some(true),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
 // ── Internal parse helpers ───────────────────────────────────────────────────
 
-/// Parses the content of `#[allocator(...)]` on a method:
-///   `[unsafe ,] Type => Expr`
+/// Parses the content of `#[allocator(...)]` on a method: `Type => Expr`
 struct ExplicitArgs {
-    is_unsafe: bool,
     ty: Type,
     expr: Expr,
 }
 
 impl Parse for ExplicitArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        // Optional leading `unsafe ,`
-        let is_unsafe = if input.peek(Token![unsafe]) {
-            input.parse::<Token![unsafe]>()?;
-            input.parse::<Token![,]>()?;
-            true
-        } else {
-            false
-        };
         let ty: Type = input.parse()?;
         input.parse::<Token![=>]>()?;
         let expr: Expr = input.parse()?;
-        Ok(ExplicitArgs { is_unsafe, ty, expr })
+        Ok(ExplicitArgs { ty, expr })
     }
 }

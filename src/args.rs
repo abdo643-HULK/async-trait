@@ -43,19 +43,11 @@ fn try_parse(input: ParseStream) -> Result<Args> {
             input.parse::<kw::allocator>()?;
             let content;
             syn::parenthesized!(content in input);
-            // Optional leading `unsafe ,`
-            let is_unsafe = if content.peek(Token![unsafe]) {
-                content.parse::<Token![unsafe]>()?;
-                content.parse::<Token![,]>()?;
-                true
-            } else {
-                false
-            };
             let ty: Type = content.parse()?;
             content.parse::<Token![=>]>()?;
             let expr: Expr = content.parse()?;
             allocator = Some(AllocatorAttr {
-                is_unsafe,
+                is_unsafe: false,
                 source: AllocatorSource::Explicit { ty, expr },
             });
         } else {
