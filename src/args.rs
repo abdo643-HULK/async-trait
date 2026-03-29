@@ -4,9 +4,9 @@ use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::{Expr, Token, Type};
 
 pub struct Args {
-    /// `false` (default) – no `Send` bound on the returned future, matching Rust's native AFIT.
-    /// `true`            – add `+ Send` (opt-in via `#[async_trait(Send)]`).
-    pub is_send: bool,
+    /// `true` (default) – no `Send` bound; future is thread-local, matching Rust's native AFIT.
+    /// `false`          – add `+ Send` (opt-in via `#[async_trait(Send)]`).
+    pub local: bool,
     /// Optional default allocator applied to every method that does not carry its own
     /// `#[allocator(...)]` attribute.
     pub allocator: Option<AllocatorAttr>,
@@ -27,7 +27,7 @@ impl Parse for Args {
 }
 
 fn try_parse(input: ParseStream) -> Result<Args> {
-    let mut is_send = false;
+    let mut local = true;
     let mut allocator = None;
 
     while !input.is_empty() {
@@ -35,10 +35,10 @@ fn try_parse(input: ParseStream) -> Result<Args> {
             // `?Send` — explicit "no Send" (same as the default, but self-documenting)
             input.parse::<Token![?]>()?;
             input.parse::<kw::Send>()?;
-            is_send = false;
+            local = true;
         } else if input.peek(kw::Send) {
             input.parse::<kw::Send>()?;
-            is_send = true;
+            local = false;
         } else if input.peek(kw::allocator) {
             input.parse::<kw::allocator>()?;
             let content;
@@ -61,7 +61,7 @@ fn try_parse(input: ParseStream) -> Result<Args> {
         }
     }
 
-    Ok(Args { is_send, allocator })
+    Ok(Args { local, allocator })
 }
 
 fn error() -> Error {

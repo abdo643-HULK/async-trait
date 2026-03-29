@@ -71,7 +71,7 @@ pub fn expand(input: &mut Item, args: &Args) {
                         if method_alloc.is_none() {
                             method_alloc = extract_param_alloc(sig);
                         }
-                        let is_local = method_is_local(args.is_send, send_override);
+                        let is_local = method_is_local(args.local, send_override);
                         let effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
@@ -124,7 +124,7 @@ pub fn expand(input: &mut Item, args: &Args) {
                         if method_alloc.is_none() {
                             method_alloc = extract_param_alloc(sig);
                         }
-                        let is_local = method_is_local(args.is_send, send_override);
+                        let is_local = method_is_local(args.local, send_override);
                         let effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
@@ -148,7 +148,7 @@ pub fn expand(input: &mut Item, args: &Args) {
                         let has_self = has_self_in_sig(sig);
 
                         // Verbatim items have no attrs vec to extract from, use defaults.
-                        let is_local = !args.is_send;
+                        let is_local = args.local;
                         let effective_alloc = args.allocator.as_ref();
 
                         transform_sig(
@@ -173,8 +173,8 @@ pub fn expand(input: &mut Item, args: &Args) {
 
 /// Resolve whether a specific method should be local (no Send) given the trait-level default
 /// and an optional per-method override.
-fn method_is_local(trait_is_send: bool, send_override: Option<bool>) -> bool {
-    !send_override.unwrap_or(trait_is_send)
+fn method_is_local(trait_is_local: bool, send_override: Option<bool>) -> bool {
+    send_override.map(|s| !s).unwrap_or(trait_is_local)
 }
 
 /// Extract and strip per-method `#[async_trait(Send)]`, `#[async_trait(?Send)]`, and
