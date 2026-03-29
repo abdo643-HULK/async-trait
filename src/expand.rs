@@ -201,7 +201,7 @@ fn extract_method_config(
                     return false;
                 }
             }
-            // `#[allocator(Type => expr)]` or `#[allocator(unsafe, Type => expr)]`
+            // `#[allocator(Type => expr)]` or `#[unsafe(allocator(Type => expr))]`
             if let Some(alloc) = allocator::try_method_alloc(attr) {
                 method_alloc = Some(alloc);
                 return false;

@@ -1,9 +1,3 @@
-//! [![github]](https://github.com/dtolnay/async-trait)&ensp;[![crates-io]](https://crates.io/crates/async-trait)&ensp;[![docs-rs]](https://docs.rs/async-trait)
-//!
-//! [github]: https://img.shields.io/badge/github-8da0cb?style=for-the-badge&labelColor=555555&logo=github
-//! [crates-io]: https://img.shields.io/badge/crates.io-fc8d62?style=for-the-badge&labelColor=555555&logo=rust
-//! [docs-rs]: https://img.shields.io/badge/docs.rs-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs
-//!
 //! <br>
 //!
 //! <h4>Type erasure for async trait methods</h4>
@@ -118,8 +112,9 @@
 //! It is the intention that all features of Rust traits should work nicely with
 //! #\[async_trait\], but the edge cases are numerous. Please file an issue if
 //! you see unexpected borrow checker errors, type errors, or warnings. There is
-//! no use of `unsafe` in the expanded code, so rest assured that if your code
-//! compiles it can't be that badly broken.
+//! no use of `unsafe` in the expanded code (unless you opt in with
+//! `#[unsafe(allocator(...))]`), so rest assured that if your code compiles it
+//! can't be that badly broken.
 //!
 //! > &#9745;&emsp;Self by value, by reference, by mut reference, or no self;<br>
 //! > &#9745;&emsp;Any number of arguments, any return value;<br>
