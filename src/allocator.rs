@@ -49,18 +49,15 @@ impl AllocatorAttr {
 /// Returns `None` if the attribute is not an allocator attribute.
 pub fn try_method_alloc(attr: &Attribute) -> Option<AllocatorAttr> {
     if attr.path().is_ident("allocator") {
-        // #[allocator(Type => expr)] — safe path
-        match &attr.meta {
-            // bare `#[allocator]` – parameter-level marker, not a method-level one
-            Meta::Path(_) => None,
-            Meta::List(_) => {
-                let args: ExplicitArgs = attr.parse_args().ok()?;
-                Some(AllocatorAttr {
-                    is_unsafe: false,
-                    source: AllocatorSource::Explicit { ty: args.ty, expr: args.expr },
-                })
-            }
-            _ => None,
+        // #[allocator(Type => expr)] — safe path; bare #[allocator] (Meta::Path) falls through
+        if let Meta::List(_) = &attr.meta {
+            let args: ExplicitArgs = attr.parse_args().ok()?;
+            Some(AllocatorAttr {
+                is_unsafe: false,
+                source: AllocatorSource::Explicit { ty: args.ty, expr: args.expr },
+            })
+        } else {
+            None
         }
     } else if attr.path().is_ident("unsafe") {
         // #[unsafe(allocator(Type => expr))] — unsafe path
