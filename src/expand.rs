@@ -641,10 +641,22 @@ fn transform_block(
                     }
                 })
             } else {
-                quote_spanned!(span=> {
-                    let __pin_allocator = #alloc_expr;
-                    ::std::boxed::Box::pin_in(async move { #let_ret }, __pin_allocator)
-                })
+                let alloc_ty = a.ty();
+                if has_non_static_lifetime(alloc_ty) {
+                    syn::Error::new(
+                        syn::spanned::Spanned::span(alloc_ty),
+                        "allocator type has a non-`'static` lifetime; \
+                         `Box::pin_in` requires `A: 'static` \
+                         — use `#[unsafe(allocator(Type => expr))]` to opt out of that bound \
+                         (you must guarantee the allocator outlives the pinned future)",
+                    )
+                    .to_compile_error()
+                } else {
+                    quote_spanned!(span=> {
+                        let __pin_allocator = #alloc_expr;
+                        ::std::boxed::Box::pin_in(async move { #let_ret }, __pin_allocator)
+                    })
+                }
             }
         }
     };
@@ -653,6 +665,43 @@ fn transform_block(
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `ty` contains any lifetime that is not `'static`.
+///
+/// Works by scanning the token stream of the type for `'ident` pairs where the
+/// ident is not `"static"`. This is a syntactic check — it catches explicit
+/// lifetime annotations like `BumpAlloc<'arena>` or `&'a Arena`, but not
+/// implicit lifetimes on bare type names.
+fn has_non_static_lifetime(ty: &Type) -> bool {
+    use proc_macro2::TokenTree;
+    use quote::ToTokens;
+
+    fn scan(tokens: proc_macro2::TokenStream) -> bool {
+        let mut iter = tokens.into_iter().peekable();
+        while let Some(tt) = iter.next() {
+            match tt {
+                TokenTree::Punct(ref p) if p.as_char() == '\'' => {
+                    if let Some(TokenTree::Ident(ident)) = iter.peek() {
+                        if ident != "static" {
+                            return true;
+                        }
+                    }
+                }
+                TokenTree::Group(g) => {
+                    if scan(g.stream()) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    let mut ts = proc_macro2::TokenStream::new();
+    ty.to_tokens(&mut ts);
+    scan(ts)
+}
 
 fn positional_arg(i: usize, pat: &Pat) -> Ident {
     let span = syn::spanned::Spanned::span(pat).resolved_at(Span::mixed_site());
