@@ -258,6 +258,12 @@ use syn::parse_macro_input;
 pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    expand(&mut item, &args);
-    TokenStream::from(quote!(#item))
+    let expand_result = expand(&mut item, &args);
+    // Always emit the (partially-transformed) item so that IDEs and rust-analyzer
+    // can still perform type-checking and provide useful secondary diagnostics.
+    let mut output = TokenStream::from(quote!(#item));
+    if let Err(e) = expand_result {
+        output.extend(TokenStream::from(e.to_compile_error()));
+    }
+    output
 }

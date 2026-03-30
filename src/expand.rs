@@ -12,9 +12,10 @@ use std::mem;
 use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
-    parse_quote, parse_quote_spanned, Attribute, Block, FnArg, GenericArgument, GenericParam,
-    Generics, Ident, ImplItem, Lifetime, LifetimeParam, Pat, PatIdent, PathArguments, Receiver,
-    ReturnType, Signature, Token, TraitItem, Type, TypeInfer, TypePath, WhereClause,
+    parse_quote, parse_quote_spanned, Attribute, Block, Error, FnArg, GenericArgument,
+    GenericParam, Generics, Ident, ImplItem, Lifetime, LifetimeParam, Pat, PatIdent,
+    PathArguments, Receiver, Result, ReturnType, Signature, Token, TraitItem, Type, TypeInfer,
+    TypePath, WhereClause,
 };
 
 impl ToTokens for Item {
@@ -55,7 +56,41 @@ impl Context<'_> {
     }
 }
 
-pub fn expand(input: &mut Item, args: &Args) {
+// ── Error accumulator ────────────────────────────────────────────────────────
+
+struct Errors(Option<Error>);
+
+impl Errors {
+    fn append(&mut self, error: Error) {
+        match &mut self.0 {
+            Some(e) => e.combine(error),
+            None => self.0 = Some(error),
+        }
+    }
+}
+
+impl Extend<Error> for Errors {
+    fn extend<T: IntoIterator<Item = Error>>(&mut self, iter: T) {
+        let mut iter = iter.into_iter();
+        if let Some(mut e) = self.0.take().or_else(|| iter.next()) {
+            e.extend(iter);
+            self.0 = Some(e);
+        }
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+pub fn expand(input: &mut Item, args: &Args) -> Result<()> {
+    let mut errors = Errors(None);
+    expand_inner(input, args, &mut errors);
+    match errors.0 {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
     match input {
         Item::Trait(input) => {
             let context = Context::Trait {
@@ -67,9 +102,9 @@ pub fn expand(input: &mut Item, args: &Args) {
                     let sig = &mut method.sig;
                     if sig.asyncness.is_some() {
                         let (send_override, mut method_alloc) =
-                            extract_method_config(&mut method.attrs);
+                            extract_method_config(&mut method.attrs, args.local, errors);
                         if method_alloc.is_none() {
-                            method_alloc = extract_param_alloc(sig);
+                            method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
                         let effective_alloc =
@@ -94,6 +129,8 @@ pub fn expand(input: &mut Item, args: &Args) {
                             is_local,
                             effective_alloc,
                         );
+                    } else {
+                        check_async_trait_not_allowed(&mut method.attrs, errors);
                     }
                 }
             }
@@ -120,9 +157,9 @@ pub fn expand(input: &mut Item, args: &Args) {
                         let has_self = has_self_in_sig(sig);
 
                         let (send_override, mut method_alloc) =
-                            extract_method_config(&mut method.attrs);
+                            extract_method_config(&mut method.attrs, args.local, errors);
                         if method_alloc.is_none() {
-                            method_alloc = extract_param_alloc(sig);
+                            method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
                         let effective_alloc =
@@ -138,6 +175,9 @@ pub fn expand(input: &mut Item, args: &Args) {
                             effective_alloc,
                         );
                         method.attrs.push(lint_suppress_with_body());
+                    }
+                    ImplItem::Fn(method) => {
+                        check_async_trait_not_allowed(&mut method.attrs, errors);
                     }
                     ImplItem::Verbatim(tokens) => {
                         let mut method = match syn::parse2::<VerbatimFn>(tokens.clone()) {
@@ -184,8 +224,12 @@ fn method_is_local(trait_is_local: bool, send_override: Option<bool>) -> bool {
 /// - `send_override` is `Some(true)` for `#[async_trait(Send)]`,
 ///   `Some(false)` for `#[async_trait(?Send)]`, `None` if absent.
 /// - `method_alloc` is the parsed `AllocatorAttr` if present.
+///
+/// Errors are appended to `errors` rather than returned.
 fn extract_method_config(
     attrs: &mut Vec<Attribute>,
+    trait_is_local: bool,
+    errors: &mut Errors,
 ) -> (Option<bool>, Option<AllocatorAttr>) {
     let mut send_override: Option<bool> = None;
     let mut method_alloc: Option<AllocatorAttr> = None;
@@ -196,26 +240,52 @@ fn extract_method_config(
         .filter(|attr| {
             // `#[async_trait(Send)]` or `#[async_trait(?Send)]` on the method
             if attr.path().is_ident("async_trait") {
-                if let Ok(arg) = attr.parse_args::<MethodSendArg>() {
-                    send_override = Some(arg.is_send);
+                let span = syn::spanned::Spanned::span(attr);
+                if send_override.is_some() {
+                    errors.append(Error::new(span, "duplicate #[async_trait] on method"));
                     return false;
                 }
-            }
-            // `#[allocator(Type => expr)]` or `#[unsafe(allocator(Type => expr))]`
-            if let Some(alloc) = allocator::try_method_alloc(attr) {
-                method_alloc = Some(alloc);
+                match attr.parse_args::<MethodSendArg>() {
+                    Ok(arg) => {
+                        let override_is_local = !arg.is_send;
+                        if override_is_local == trait_is_local {
+                            errors.append(Error::new(
+                                span,
+                                if trait_is_local {
+                                    "redundant #[async_trait(?Send)] on method"
+                                } else {
+                                    "redundant #[async_trait(Send)] on method"
+                                },
+                            ));
+                        } else {
+                            send_override = Some(arg.is_send);
+                        }
+                    }
+                    Err(e) => errors.append(Error::new(span, e)),
+                }
                 return false;
             }
-            true
+            // `#[allocator(Type => expr)]` or `#[unsafe(allocator(Type => expr))]`
+            match allocator::try_method_alloc(attr) {
+                Some(Ok(alloc)) => {
+                    method_alloc = Some(alloc);
+                    false
+                }
+                Some(Err(e)) => {
+                    errors.append(e);
+                    false
+                }
+                None => true,
+            }
         })
         .collect();
 
     (send_override, method_alloc)
 }
 
-/// Scan `sig.inputs` for a parameter annotated with `#[allocator]` or `#[allocator(unsafe)]`.
+/// Scan `sig.inputs` for a parameter annotated with `#[allocator]` or `#[unsafe(allocator)]`.
 /// Strips the attribute from the parameter and returns the corresponding `AllocatorAttr`.
-fn extract_param_alloc(sig: &mut Signature) -> Option<AllocatorAttr> {
+fn extract_param_alloc(sig: &mut Signature, errors: &mut Errors) -> Option<AllocatorAttr> {
     for arg in sig.inputs.iter_mut() {
         if let FnArg::Typed(typed) = arg {
             let mut found: Option<bool> = None;
@@ -223,11 +293,17 @@ fn extract_param_alloc(sig: &mut Signature) -> Option<AllocatorAttr> {
             typed.attrs = old_attrs
                 .into_iter()
                 .filter(|attr| {
-                    if let Some(is_unsafe) = allocator::try_param_alloc_marker(attr) {
-                        found = Some(is_unsafe);
-                        return false;
+                    match allocator::try_param_alloc_marker(attr) {
+                        Some(Ok(is_unsafe)) => {
+                            found = Some(is_unsafe);
+                            false
+                        }
+                        Some(Err(e)) => {
+                            errors.append(e);
+                            false
+                        }
+                        None => true,
                     }
-                    true
                 })
                 .collect();
 
@@ -263,6 +339,27 @@ impl syn::parse::Parse for MethodSendArg {
             Ok(MethodSendArg { is_send: true })
         }
     }
+}
+
+// ── Attribute checks ─────────────────────────────────────────────────────────
+
+/// Strip any `#[async_trait(...)]` attributes from a non-async method and report them as errors.
+fn check_async_trait_not_allowed(attrs: &mut Vec<Attribute>, errors: &mut Errors) {
+    let old = mem::take(attrs);
+    *attrs = old
+        .into_iter()
+        .filter(|attr| {
+            if attr.path().is_ident("async_trait") {
+                errors.append(Error::new(
+                    syn::spanned::Spanned::span(attr),
+                    "#[async_trait] attribute is not allowed on non-async methods",
+                ));
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
 }
 
 // ── Lint suppression attributes ──────────────────────────────────────────────
