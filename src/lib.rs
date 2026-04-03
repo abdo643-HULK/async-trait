@@ -166,6 +166,17 @@
 //! #[async_trait(Send)]
 //! trait SendTrait {
 //!     async fn must_be_send(&self);
+//!
+//!     // This one method opts back out of Send.
+//!     #[async_trait(?Send)]
+//!     async fn may_use_thread_local(&self);
+//! }
+//!
+//! #[async_trait]
+//! trait LocalTrait {
+//!     // Trait is local (?Send) by default; this method opts in.
+//!     #[async_trait(Send)]
+//!     async fn this_one_is_send(&self);
 //! }
 //! ```
 //!
@@ -217,6 +228,131 @@
 //!     async fn test(elided: Elided<'_>) {}
 //! }
 //! ```
+//!
+//! ## Lifetime elision in return types
+//!
+//! **Important:** `'_` in a return type follows standard Rust elision rules and
+//! resolves to the receiver's lifetime (`&self`). It does **not** automatically
+//! match a `'_` that appears in a parameter type.
+//!
+//! ```
+//! # use async_trait::async_trait;
+//! # type BorrowedAlloc<'a> = &'a ();
+//! # type Output<'a> = &'a ();
+//! #[async_trait]
+//! trait Broken {
+//!     // The `'_` in the return type resolves to `&self`'s lifetime —
+//!     // NOT to the `'_` inside `BorrowedAlloc<'_>`.
+//!     // An impl body that returns data with BorrowedAlloc's lifetime will
+//!     // fail to compile with a lifetime mismatch error.
+//!     async fn load(&self, alloc: BorrowedAlloc<'_>) -> Output<'_>;
+//! }
+//! ```
+//!
+//! Name the lifetime explicitly when the return type should share a lifetime
+//! with a specific parameter:
+//!
+//! ```
+//! # use async_trait::async_trait;
+//! # type BorrowedAlloc<'a> = &'a ();
+//! # type Output<'a> = &'a ();
+//! #[async_trait]
+//! trait Fixed {
+//!     async fn load<'a>(&self, alloc: BorrowedAlloc<'a>) -> Output<'a>;
+//! }
+//! ```
+
+//! # Custom allocators (nightly)
+//!
+//! On nightly Rust with `#![feature(allocator_api)]`, you can route the
+//! `Box` that wraps the returned future through a custom allocator.
+//!
+//! ## Method-level attribute
+//!
+//! Write the allocator type in the trait declaration, and pair it with an
+//! expression in each impl:
+//!
+//! ```
+//! # const IGNORE: &str = stringify! {
+//! use std::alloc::Global;
+//!
+//! #[async_trait]
+//! trait Stored {
+//!     // Trait: type only — no expression needed (no body).
+//!     #[allocator(Global)]
+//!     async fn work(&self) -> u32;
+//! }
+//!
+//! #[async_trait]
+//! impl Stored for MyType {
+//!     // Impl: expression required (this is where the allocator is constructed).
+//!     #[allocator(Global => Global)]
+//!     async fn work(&self) -> u32 { 42 }
+//! }
+//! # };
+//! ```
+//!
+//! For trait methods that have a **default body**, the full
+//! `#[allocator(Type => expr)]` form is required on both the declaration and
+//! any overriding impl.
+//!
+//! ## Parameter-level marker
+//!
+//! Alternatively, mark one parameter with `#[allocator]`. The parameter's
+//! type becomes the allocator and the parameter itself is the expression; it
+//! is consumed before the `async` block rather than moved inside it:
+//!
+//! ```
+//! # const IGNORE: &str = stringify! {
+//! #[async_trait]
+//! trait ParamAlloc {
+//!     async fn work(&self, #[allocator] alloc: MyAlloc) -> u32;
+//! }
+//! # };
+//! ```
+//!
+//! ## Trait-level default
+//!
+//! Apply the allocator to every method in the trait or impl by putting it on
+//! the `#[async_trait]` attribute itself:
+//!
+//! ```
+//! # const IGNORE: &str = stringify! {
+//! #[async_trait(allocator(BumpAlloc => BumpAlloc::new()))]
+//! trait BumpAllocTrait {
+//!     async fn foo(&self) -> u32;
+//!     async fn bar(&self) -> u32;
+//!
+//!     // Opt a single method out of the trait-level default:
+//!     #[allocator(none)]
+//!     async fn ping(&self);
+//! }
+//! # };
+//! ```
+//!
+//! The same `#[async_trait(allocator(...))]` annotation must appear on the
+//! corresponding impl block. Per-method `#[allocator(Type => expr)]`
+//! attributes override the default for that method; `#[allocator(none)]`
+//! suppresses it entirely.
+//!
+//! ## Unsafe allocators
+//!
+//! `Box::pin_in` requires `A: 'static`. If your allocator borrows from a
+//! shorter-lived scope, use the unsafe form to bypass that bound (you take
+//! responsibility for ensuring the allocator outlives the pinned future):
+//!
+//! ```
+//! # const IGNORE: &str = stringify! {
+//! #[async_trait]
+//! trait ArenaAlloc {
+//!     #[unsafe(allocator(ArenaAlloc<'_>))]
+//!     async fn work(&self) -> u32;
+//! }
+//! # };
+//! ```
+//!
+//! The `unsafe(allocator(...))` form uses
+//! `Pin::new_unchecked(Box::new_in(fut, alloc))` instead of `Box::pin_in`.
 
 #![doc(html_root_url = "https://docs.rs/async-trait/0.1.89")]
 #![allow(

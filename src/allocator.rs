@@ -2,6 +2,10 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::spanned::Spanned;
 use syn::{Attribute, Error, Expr, Ident, Meta, Token, Type};
 
+mod kw {
+    syn::custom_keyword!(none);
+}
+
 /// Allocator configuration attached to a single async method.
 #[derive(Clone)]
 pub struct AllocatorAttr {
@@ -20,25 +24,29 @@ pub enum AllocatorSource {
     /// Valid for any method that has a body (default or impl).
     TypeAndExpr { ty: Type, expr: Expr },
     /// `#[allocator(=> expr)]` — expression only, type inferred from the trait requirement.
-    /// Valid for impl methods only.
+    /// Recognised for diagnostics; always an error (type cannot be inferred).
     ExprOnly { expr: Expr },
     /// `#[allocator]` or `#[unsafe(allocator)]` on a function parameter.
     /// The type and identifier are inferred from the parameter itself.
     Param { ty: Type, ident: Ident },
+    /// `#[allocator(none)]` — explicit opt-out of the trait-level allocator default.
+    /// Forces `Box::pin` (Global allocator) for this method even when the enclosing
+    /// `#[async_trait(allocator(...))]` would otherwise apply.
+    OptOut { span: proc_macro2::Span },
 }
 
 impl AllocatorAttr {
-    /// Returns the allocator type if explicitly specified, or `None` for `ExprOnly`.
+    /// Returns the allocator type if explicitly specified, or `None` for `ExprOnly`/`OptOut`.
     pub fn ty(&self) -> Option<&Type> {
         match &self.source {
             AllocatorSource::TypeOnly { ty }
             | AllocatorSource::TypeAndExpr { ty, .. }
             | AllocatorSource::Param { ty, .. } => Some(ty),
-            AllocatorSource::ExprOnly { .. } => None,
+            AllocatorSource::ExprOnly { .. } | AllocatorSource::OptOut { .. } => None,
         }
     }
 
-    /// Returns a token stream for the allocator expression, or `None` for `TypeOnly`.
+    /// Returns a token stream for the allocator expression, or `None` for `TypeOnly`/`OptOut`.
     pub fn expr_tokens(&self) -> Option<proc_macro2::TokenStream> {
         use quote::quote;
         match &self.source {
@@ -46,7 +54,7 @@ impl AllocatorAttr {
                 Some(quote!(#expr))
             }
             AllocatorSource::Param { ident, .. } => Some(quote!(#ident)),
-            AllocatorSource::TypeOnly { .. } => None,
+            AllocatorSource::TypeOnly { .. } | AllocatorSource::OptOut { .. } => None,
         }
     }
 }
@@ -73,9 +81,10 @@ pub fn try_method_alloc(attr: &Attribute) -> Option<Result<AllocatorAttr>> {
     if attr.path().is_ident("allocator") {
         // #[allocator(...)] — safe path; bare #[allocator] (Meta::Path) is for params only
         if let Meta::List(_) = &attr.meta {
+            let attr_span = attr.span();
             Some(attr.parse_args::<ExplicitArgs>().map(|args| AllocatorAttr {
                 is_unsafe: false,
-                source: args.into_source(),
+                source: args.into_source(attr_span),
             }))
         } else {
             None
@@ -93,7 +102,7 @@ pub fn try_method_alloc(attr: &Attribute) -> Option<Result<AllocatorAttr>> {
                     syn::parse2::<ExplicitArgs>(list.tokens)
                         .map(|args| AllocatorAttr {
                             is_unsafe: true,
-                            source: args.into_source(),
+                            source: args.into_source(span),
                         })
                         .map_err(|_| {
                             Error::new(
@@ -149,19 +158,22 @@ pub fn try_param_alloc_marker(attr: &Attribute) -> Option<Result<bool>> {
 
 /// Parsed content of `#[allocator(...)]` on a method.
 ///
-/// Three forms:
+/// Four forms:
+/// * `none`          → `OptOut`  (explicit no-allocator override)
 /// * `Type`          → `TypeOnly`
 /// * `Type => Expr`  → `TypeAndExpr`
 /// * `=> Expr`       → `ExprOnly`
 enum ExplicitArgs {
+    OptOut,
     TypeOnly(Type),
     TypeAndExpr(Type, Expr),
     ExprOnly(Expr),
 }
 
 impl ExplicitArgs {
-    fn into_source(self) -> AllocatorSource {
+    fn into_source(self, attr_span: proc_macro2::Span) -> AllocatorSource {
         match self {
+            ExplicitArgs::OptOut => AllocatorSource::OptOut { span: attr_span },
             ExplicitArgs::TypeOnly(ty) => AllocatorSource::TypeOnly { ty },
             ExplicitArgs::TypeAndExpr(ty, expr) => AllocatorSource::TypeAndExpr { ty, expr },
             ExplicitArgs::ExprOnly(expr) => AllocatorSource::ExprOnly { expr },
@@ -171,7 +183,11 @@ impl ExplicitArgs {
 
 impl Parse for ExplicitArgs {
     fn parse(input: ParseStream) -> Result<Self> {
-        if input.peek(Token![=>]) {
+        if input.peek(kw::none) {
+            // `none` — explicit opt-out form
+            input.parse::<kw::none>()?;
+            Ok(ExplicitArgs::OptOut)
+        } else if input.peek(Token![=>]) {
             // `=> expr` — expression-only form
             input.parse::<Token![=>]>()?;
             let expr: Expr = input.parse()?;

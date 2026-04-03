@@ -1877,6 +1877,29 @@ pub mod custom_allocator {
         }
     }
 
+    // Form 5 — #[allocator(none)] opt-out: selectively disable the trait-level default.
+    #[async_trait(allocator(Global => Global))]
+    trait MixedAlloc {
+        // This method inherits the trait-level Global allocator.
+        async fn with_default_alloc(&self) -> u32;
+
+        // This method opts out; it uses Box::pin (Global) regardless of the trait default.
+        #[allocator(none)]
+        async fn explicit_no_alloc(&self) -> u32;
+    }
+
+    #[async_trait(allocator(Global => Global))]
+    impl MixedAlloc for S {
+        async fn with_default_alloc(&self) -> u32 {
+            80
+        }
+
+        #[allocator(none)]
+        async fn explicit_no_alloc(&self) -> u32 {
+            90
+        }
+    }
+
     #[test]
     fn test() {
         futures::executor::block_on(async {
@@ -1888,6 +1911,8 @@ pub mod custom_allocator {
             assert_eq!(s.bar().await, 50);
             assert_eq!(s.default_alloc().await, 60);
             assert_eq!(s.no_alloc().await, 70);
+            assert_eq!(s.with_default_alloc().await, 80);
+            assert_eq!(s.explicit_no_alloc().await, 90);
         });
     }
 }

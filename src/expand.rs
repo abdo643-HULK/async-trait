@@ -107,7 +107,7 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
-                        let effective_alloc =
+                        let mut effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
                         // Validate that the method-level allocator uses the correct form.
@@ -116,6 +116,18 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                         if let Some(ref a) = method_alloc {
                             let has_body = method.default.is_some();
                             match &a.source {
+                                AllocatorSource::OptOut { span } => {
+                                    // Explicit opt-out of the trait-level allocator default.
+                                    // Warn if there is no trait-level allocator to opt out of.
+                                    if args.allocator.is_none() {
+                                        errors.append(Error::new(
+                                            *span,
+                                            "redundant `#[allocator(none)]`: \
+                                             no trait-level allocator is configured",
+                                        ));
+                                    }
+                                    effective_alloc = None;
+                                }
                                 AllocatorSource::ExprOnly { expr } => {
                                     errors.append(Error::new(
                                         syn::spanned::Spanned::span(expr),
@@ -193,17 +205,42 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
-                        let effective_alloc =
+                        let mut effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
                         // Validate that the method-level allocator uses the correct form.
+                        // On error, clear effective_alloc so both transforms fall back to
+                        // Box::pin (no allocator), giving clean IDE error recovery with no
+                        // secondary type-mismatch errors.
                         if let Some(ref a) = method_alloc {
-                            if let AllocatorSource::TypeOnly { ty } = &a.source {
-                                errors.append(Error::new(
-                                    syn::spanned::Spanned::span(ty),
-                                    "expression required in impl method bodies; \
-                                     use `#[allocator(Type => expr)]` or `#[allocator(=> expr)]`",
-                                ));
+                            match &a.source {
+                                AllocatorSource::OptOut { span } => {
+                                    if args.allocator.is_none() {
+                                        errors.append(Error::new(
+                                            *span,
+                                            "redundant `#[allocator(none)]`: \
+                                             no trait-level allocator is configured",
+                                        ));
+                                    }
+                                    effective_alloc = None;
+                                }
+                                AllocatorSource::TypeOnly { ty } => {
+                                    errors.append(Error::new(
+                                        syn::spanned::Spanned::span(ty),
+                                        "expression required in impl method bodies; \
+                                         use `#[allocator(Type => expr)]` or `#[allocator(=> expr)]`",
+                                    ));
+                                    effective_alloc = None;
+                                }
+                                AllocatorSource::ExprOnly { expr } => {
+                                    errors.append(Error::new(
+                                        syn::spanned::Spanned::span(expr),
+                                        "allocator type cannot be inferred from the trait \
+                                         declaration; use `#[allocator(Type => expr)]`",
+                                    ));
+                                    effective_alloc = None;
+                                }
+                                _ => {}
                             }
                         }
 
