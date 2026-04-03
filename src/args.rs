@@ -48,7 +48,7 @@ fn try_parse(input: ParseStream) -> Result<Args> {
             let expr: Expr = content.parse()?;
             allocator = Some(AllocatorAttr {
                 is_unsafe: false,
-                source: AllocatorSource::Explicit { ty, expr },
+                source: AllocatorSource::TypeAndExpr { ty, expr },
             });
         } else {
             return Err(input.error(

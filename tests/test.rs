@@ -1798,10 +1798,11 @@ pub mod custom_allocator {
     use async_trait::async_trait;
     use std::alloc::Global;
 
-    // Form 1 — explicit type + expression (safe path, A: 'static)
+    // Form 1 — type-only on the trait declaration, full form on the impl.
     #[async_trait]
     trait ExplicitAlloc {
-        #[allocator(Global => Global)]
+        // TypeOnly: expression is not needed here (no default body).
+        #[allocator(Global)]
         async fn with_alloc(&self) -> u32;
 
         async fn without_alloc(&self) -> u32;
@@ -1811,6 +1812,7 @@ pub mod custom_allocator {
 
     #[async_trait]
     impl ExplicitAlloc for S {
+        // TypeAndExpr: expression is required in the impl body.
         #[allocator(Global => Global)]
         async fn with_alloc(&self) -> u32 {
             10

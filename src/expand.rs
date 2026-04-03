@@ -110,6 +110,37 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                         let effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
+                        // Validate that the method-level allocator uses the correct form.
+                        // `Param` sources have no form to validate; args.allocator is always
+                        // TypeAndExpr (enforced by the attribute parser in args.rs).
+                        if let Some(ref a) = method_alloc {
+                            let has_body = method.default.is_some();
+                            match &a.source {
+                                AllocatorSource::ExprOnly { expr } => {
+                                    errors.append(Error::new(
+                                        syn::spanned::Spanned::span(expr),
+                                        "allocator type is required in trait declarations; \
+                                         use `#[allocator(Type)]` or `#[allocator(Type => expr)]`",
+                                    ));
+                                }
+                                AllocatorSource::TypeAndExpr { expr, .. } if !has_body => {
+                                    errors.append(Error::new(
+                                        syn::spanned::Spanned::span(expr),
+                                        "expression is unused (trait method has no body); \
+                                         use `#[allocator(Type)]`",
+                                    ));
+                                }
+                                AllocatorSource::TypeOnly { ty } if has_body => {
+                                    errors.append(Error::new(
+                                        syn::spanned::Spanned::span(ty),
+                                        "expression required for default method body; \
+                                         use `#[allocator(Type => expr)]`",
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+
                         let block = &mut method.default;
                         let mut has_self = has_self_in_sig(sig);
                         method.attrs.push(parse_quote!(#[must_use]));
@@ -164,6 +195,17 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                         let is_local = method_is_local(args.local, send_override);
                         let effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
+
+                        // Validate that the method-level allocator uses the correct form.
+                        if let Some(ref a) = method_alloc {
+                            if let AllocatorSource::TypeOnly { ty } = &a.source {
+                                errors.append(Error::new(
+                                    syn::spanned::Spanned::span(ty),
+                                    "expression required in impl method bodies; \
+                                     use `#[allocator(Type => expr)]` or `#[allocator(=> expr)]`",
+                                ));
+                            }
+                        }
 
                         transform_block(context, sig, block, effective_alloc);
                         transform_sig(
@@ -570,21 +612,23 @@ fn transform_sig(
         quote!(::core::marker::Send + 'async_trait)
     };
 
-    sig.output = match alloc {
+    // Determine the allocator type token to use in the Box second type parameter.
+    // `None` → omit the second parameter entirely (no allocator, or ExprOnly error-recovery).
+    // `Some(tok)` → emit `, tok`.
+    let alloc_ty_tokens: Option<TokenStream> = alloc.and_then(|a| a.ty().map(|ty| quote!(#ty)));
+
+    sig.output = match alloc_ty_tokens {
         None => parse_quote! {
             #ret_arrow ::core::pin::Pin<Box<
                 dyn ::core::future::Future<Output = #ret> + #bounds
             >>
         },
-        Some(a) => {
-            let alloc_ty = a.ty();
-            parse_quote! {
-                #ret_arrow ::core::pin::Pin<::std::boxed::Box<
-                    dyn ::core::future::Future<Output = #ret> + #bounds,
-                    #alloc_ty
-                >>
-            }
-        }
+        Some(alloc_ty) => parse_quote! {
+            #ret_arrow ::core::pin::Pin<::std::boxed::Box<
+                dyn ::core::future::Future<Output = #ret> + #bounds,
+                #alloc_ty
+            >>
+        },
     };
 }
 
@@ -727,32 +771,54 @@ fn transform_block(
             quote_spanned!(span=> Box::pin(async move { #let_ret }))
         }
         Some(a) => {
-            let alloc_expr = a.expr_tokens();
-            if a.is_unsafe {
-                quote_spanned!(span=> {
-                    let __pin_allocator = #alloc_expr;
-                    unsafe {
-                        ::core::pin::Pin::new_unchecked(
-                            ::std::boxed::Box::new_in(async move { #let_ret }, __pin_allocator)
-                        )
+            match a.expr_tokens() {
+                None => {
+                    // TypeOnly in impl context — error already reported by validate_alloc_form;
+                    // emit a fallback Box::pin for IDE error recovery.
+                    quote_spanned!(span=> Box::pin(async move { #let_ret }))
+                }
+                Some(alloc_expr) => {
+                    if a.is_unsafe {
+                        quote_spanned!(span=> {
+                            let __pin_allocator = #alloc_expr;
+                            unsafe {
+                                ::core::pin::Pin::new_unchecked(
+                                    ::std::boxed::Box::new_in(
+                                        async move { #let_ret },
+                                        __pin_allocator,
+                                    )
+                                )
+                            }
+                        })
+                    } else {
+                        // ExprOnly: no explicit type — skip the 'static lifetime check
+                        // (the type is inferred, so we cannot inspect its lifetimes here).
+                        let lifetime_error = a.ty().and_then(|alloc_ty| {
+                            if has_non_static_lifetime(alloc_ty) {
+                                Some(syn::Error::new(
+                                    syn::spanned::Spanned::span(alloc_ty),
+                                    "allocator type has a non-`'static` lifetime; \
+                                     `Box::pin_in` requires `A: 'static` \
+                                     — use `#[unsafe(allocator(...))]` to opt out of that \
+                                     bound (you must guarantee the allocator outlives the \
+                                     pinned future)",
+                                ).to_compile_error())
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(err) = lifetime_error {
+                            err
+                        } else {
+                            quote_spanned!(span=> {
+                                let __pin_allocator = #alloc_expr;
+                                ::std::boxed::Box::pin_in(
+                                    async move { #let_ret },
+                                    __pin_allocator,
+                                )
+                            })
+                        }
                     }
-                })
-            } else {
-                let alloc_ty = a.ty();
-                if has_non_static_lifetime(alloc_ty) {
-                    syn::Error::new(
-                        syn::spanned::Spanned::span(alloc_ty),
-                        "allocator type has a non-`'static` lifetime; \
-                         `Box::pin_in` requires `A: 'static` \
-                         — use `#[unsafe(allocator(Type => expr))]` to opt out of that bound \
-                         (you must guarantee the allocator outlives the pinned future)",
-                    )
-                    .to_compile_error()
-                } else {
-                    quote_spanned!(span=> {
-                        let __pin_allocator = #alloc_expr;
-                        ::std::boxed::Box::pin_in(async move { #let_ret }, __pin_allocator)
-                    })
                 }
             }
         }
