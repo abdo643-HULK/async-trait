@@ -323,8 +323,8 @@
 //!     async fn foo(&self) -> u32;
 //!     async fn bar(&self) -> u32;
 //!
-//!     // Opt a single method out of the trait-level default:
-//!     #[allocator(none)]
+//!     // Override one method back to the standard Global allocator:
+//!     #[allocator(Global)]
 //!     async fn ping(&self);
 //! }
 //! # };
@@ -332,8 +332,10 @@
 //!
 //! The same `#[async_trait(allocator(...))]` annotation must appear on the
 //! corresponding impl block. Per-method `#[allocator(Type => expr)]`
-//! attributes override the default for that method; `#[allocator(none)]`
-//! suppresses it entirely.
+//! attributes (or the unit-struct shorthand `#[allocator(Type)]`) override
+//! the default for that method. Use `#[allocator(Global)]` /
+//! `#[allocator(Global => Global)]` to explicitly route a specific method
+//! through the standard allocator instead of the trait-level default.
 //!
 //! ## Unsafe allocators
 //!
@@ -394,10 +396,12 @@ use syn::parse_macro_input;
 pub fn async_trait(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as Args);
     let mut item = parse_macro_input!(input as Item);
-    let expand_result = expand(&mut item, &args);
+    let (extra, expand_result) = expand(&mut item, &args);
     // Always emit the (partially-transformed) item so that IDEs and rust-analyzer
     // can still perform type-checking and provide useful secondary diagnostics.
-    let mut output = TokenStream::from(quote!(#item));
+    // `extra` contains the diagnostic helper module (if any) and is emitted first
+    // so it is in scope when the trait/impl references it.
+    let mut output = TokenStream::from(quote!(#extra #item));
     if let Err(e) = expand_result {
         output.extend(TokenStream::from(e.to_compile_error()));
     }
