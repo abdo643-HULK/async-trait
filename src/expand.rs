@@ -12,7 +12,7 @@ use std::mem;
 use syn::punctuated::Punctuated;
 use syn::visit_mut::{self, VisitMut};
 use syn::{
-    parse_quote, parse_quote_spanned, Attribute, Block, Error, FnArg, GenericArgument,
+    parse_quote, parse_quote_spanned, Attribute, Block, Error, Expr, FnArg, GenericArgument,
     GenericParam, Generics, Ident, ImplItem, Lifetime, LifetimeParam, Pat, PatIdent,
     PathArguments, Receiver, Result, ReturnType, Signature, Token, TraitItem, Type, TypeInfer,
     TypePath, WhereClause,
@@ -81,22 +81,43 @@ impl Extend<Error> for Errors {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn expand(input: &mut Item, args: &Args) -> Result<()> {
+/// Expand a `#[async_trait]` item.
+///
+/// Returns the modified item (in place) and a `TokenStream` of extra items that
+/// should be emitted *before* the transformed item in the output (currently the
+/// `#[diagnostic::on_unimplemented]`-annotated helper module for Send traits).
+pub fn expand(input: &mut Item, args: &Args) -> (TokenStream, Result<()>) {
     let mut errors = Errors(None);
-    expand_inner(input, args, &mut errors);
-    match errors.0 {
+    let mut extra = TokenStream::new();
+    expand_inner(input, args, &mut errors, &mut extra);
+    let result = match errors.0 {
         Some(e) => Err(e),
         None => Ok(()),
-    }
+    };
+    (extra, result)
 }
 
-fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
+fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors, extra: &mut TokenStream) {
     match input {
         Item::Trait(input) => {
             let context = Context::Trait {
                 generics: &input.generics,
                 supertraits: &input.supertraits,
             };
+
+            // For Send traits, emit a companion diagnostic module so that the
+            // `where Self: AsyncTraitSend[Sync] + 'async_trait` bound fires
+            // `#[diagnostic::on_unimplemented]` with a helpful message instead of
+            // the generic "cannot be sent between threads safely" error.
+            let diag_helper: Option<Ident> = if !args.local {
+                let mod_ident = format_ident!("__async_trait_diag_{}", input.ident);
+                let trait_name = input.ident.to_string();
+                extra.extend(diagnostic_send_module(&mod_ident, &trait_name));
+                Some(mod_ident)
+            } else {
+                None
+            };
+
             for inner in &mut input.items {
                 if let TraitItem::Fn(method) = inner {
                     let sig = &mut method.sig;
@@ -107,7 +128,7 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
-                        let mut effective_alloc =
+                        let effective_alloc =
                             method_alloc.as_ref().or(args.allocator.as_ref());
 
                         // Validate that the method-level allocator uses the correct form.
@@ -116,18 +137,6 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                         if let Some(ref a) = method_alloc {
                             let has_body = method.default.is_some();
                             match &a.source {
-                                AllocatorSource::OptOut { span } => {
-                                    // Explicit opt-out of the trait-level allocator default.
-                                    // Warn if there is no trait-level allocator to opt out of.
-                                    if args.allocator.is_none() {
-                                        errors.append(Error::new(
-                                            *span,
-                                            "redundant `#[allocator(none)]`: \
-                                             no trait-level allocator is configured",
-                                        ));
-                                    }
-                                    effective_alloc = None;
-                                }
                                 AllocatorSource::ExprOnly { expr } => {
                                     errors.append(Error::new(
                                         syn::spanned::Spanned::span(expr),
@@ -171,6 +180,7 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             has_default,
                             is_local,
                             effective_alloc,
+                            diag_helper.as_ref(),
                         );
                     } else {
                         check_async_trait_not_allowed(&mut method.attrs, errors);
@@ -205,43 +215,46 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             method_alloc = extract_param_alloc(sig, errors);
                         }
                         let is_local = method_is_local(args.local, send_override);
-                        let mut effective_alloc =
-                            method_alloc.as_ref().or(args.allocator.as_ref());
+                        // Unit-struct sugar: `#[allocator(Type)]` in an impl method body
+                        // is treated as `#[allocator(Type => Type)]`, i.e. the type token
+                        // itself is used as the allocator expression.  This works for unit
+                        // structs (Global, System, …); non-unit structs produce a natural
+                        // compiler error ("struct has fields that need initialisation").
+                        let synthetic_alloc: Option<AllocatorAttr> =
+                            if let Some(ref a) = method_alloc {
+                                if let AllocatorSource::TypeOnly { ty } = &a.source {
+                                    let ty = ty.clone();
+                                    let expr: Expr = syn::parse2(quote!(#ty))
+                                        .expect("type path is a valid expr");
+                                    Some(AllocatorAttr {
+                                        is_unsafe: a.is_unsafe,
+                                        source: AllocatorSource::TypeAndExpr { ty, expr },
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                        let mut effective_alloc: Option<&AllocatorAttr> =
+                            if let Some(ref s) = synthetic_alloc {
+                                Some(s)
+                            } else {
+                                method_alloc.as_ref().or(args.allocator.as_ref())
+                            };
 
-                        // Validate that the method-level allocator uses the correct form.
-                        // On error, clear effective_alloc so both transforms fall back to
-                        // Box::pin (no allocator), giving clean IDE error recovery with no
-                        // secondary type-mismatch errors.
-                        if let Some(ref a) = method_alloc {
-                            match &a.source {
-                                AllocatorSource::OptOut { span } => {
-                                    if args.allocator.is_none() {
-                                        errors.append(Error::new(
-                                            *span,
-                                            "redundant `#[allocator(none)]`: \
-                                             no trait-level allocator is configured",
-                                        ));
-                                    }
-                                    effective_alloc = None;
-                                }
-                                AllocatorSource::TypeOnly { ty } => {
-                                    errors.append(Error::new(
-                                        syn::spanned::Spanned::span(ty),
-                                        "expression required in impl method bodies; \
-                                         use `#[allocator(Type => expr)]` or `#[allocator(=> expr)]`",
-                                    ));
-                                    effective_alloc = None;
-                                }
-                                AllocatorSource::ExprOnly { expr } => {
-                                    errors.append(Error::new(
-                                        syn::spanned::Spanned::span(expr),
-                                        "allocator type cannot be inferred from the trait \
-                                         declaration; use `#[allocator(Type => expr)]`",
-                                    ));
-                                    effective_alloc = None;
-                                }
-                                _ => {}
-                            }
+                        // `ExprOnly` is always an error in impl context (the type cannot be
+                        // inferred from the trait declaration).  Clear effective_alloc so
+                        // both transforms fall back to Box::pin for clean IDE recovery.
+                        if let Some(AllocatorSource::ExprOnly { expr }) =
+                            method_alloc.as_ref().map(|a| &a.source)
+                        {
+                            errors.append(Error::new(
+                                syn::spanned::Spanned::span(expr),
+                                "allocator type cannot be inferred from the trait \
+                                 declaration; use `#[allocator(Type => expr)]`",
+                            ));
+                            effective_alloc = None;
                         }
 
                         transform_block(context, sig, block, effective_alloc);
@@ -252,6 +265,7 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             false,
                             is_local,
                             effective_alloc,
+                            None, // impl methods: no diagnostic helper needed
                         );
                         method.attrs.push(lint_suppress_with_body());
                     }
@@ -277,6 +291,7 @@ fn expand_inner(input: &mut Item, args: &Args, errors: &mut Errors) {
                             false,
                             is_local,
                             effective_alloc,
+                            None, // verbatim items are in impl context; no helper
                         );
                         method.attrs.push(lint_suppress_with_body());
                         *tokens = quote!(#method);
@@ -470,6 +485,60 @@ fn lint_suppress_without_body() -> Attribute {
     }
 }
 
+// ── Diagnostic helper module ─────────────────────────────────────────────────
+
+/// Generate a private module containing `#[diagnostic::on_unimplemented]`-annotated
+/// helper traits for the `Self: Send [+ Sync] + 'async_trait` bounds.
+///
+/// The module is emitted as a sibling of the `#[async_trait(Send)]` trait so that
+/// `transform_sig` can reference `self::<mod_ident>::AsyncTraitSend[Sync]` in the
+/// where clause.  This fires E0277 with a context-aware message instead of the
+/// default "cannot be sent between threads safely".
+///
+/// Two helper traits are generated:
+/// * `AsyncTraitSend`     — supertrait `Send` only (for `self` / `Arc<Self>` receivers)
+/// * `AsyncTraitSendSync` — supertraits `Send + Sync` (for `&self` / `&mut self` receivers)
+fn diagnostic_send_module(mod_ident: &Ident, trait_name: &str) -> TokenStream {
+    // Build notes as String so quote! emits them as string literals (via ToTokens for String),
+    // allowing the trait name to be embedded without using concat!() which is not a literal.
+    let note_send = format!(
+        "all implementations of `{trait_name}` must be `Send`; \
+         `#[async_trait]` wraps async fn return types in \
+         `Pin<Box<dyn Future<Output = ...> + Send + '_>>`"
+    );
+    let note_send_sync = format!(
+        "all implementations of `{trait_name}` must be `Send + Sync`; \
+         `&self` receivers require `Send + Sync` so that `&Self` is `Send`"
+    );
+    let note_opt_out = "use `#[async_trait(?Send)]` to allow non-`Send` implementations";
+
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case, dead_code)]
+        mod #mod_ident {
+            #[diagnostic::on_unimplemented(
+                message = "`{Self}` cannot implement this async trait method because it is not `Send`",
+                note = #note_send,
+                note = #note_opt_out,
+            )]
+            pub trait AsyncTraitSend: ::core::marker::Send {}
+
+            #[diagnostic::do_not_recommend]
+            impl<T: ::core::marker::Send> AsyncTraitSend for T {}
+
+            #[diagnostic::on_unimplemented(
+                message = "`{Self}` cannot implement this async trait method because it is not `Send + Sync`",
+                note = #note_send_sync,
+                note = #note_opt_out,
+            )]
+            pub trait AsyncTraitSendSync: ::core::marker::Send + ::core::marker::Sync {}
+
+            #[diagnostic::do_not_recommend]
+            impl<T: ::core::marker::Send + ::core::marker::Sync> AsyncTraitSendSync for T {}
+        }
+    }
+}
+
 // ── Signature transformation ─────────────────────────────────────────────────
 
 // Input:
@@ -495,6 +564,7 @@ fn transform_sig(
     has_default: bool,
     is_local: bool,
     alloc: Option<&AllocatorAttr>,
+    send_helper: Option<&Ident>,
 ) {
     sig.fn_token.span = sig.asyncness.take().unwrap().span;
 
@@ -605,16 +675,39 @@ fn transform_sig(
             &[InferredBound::Send]
         };
 
-        let bounds = bounds.iter().filter(|bound| match context {
-            Context::Trait { supertraits, .. } => has_default && !has_bound(supertraits, bound),
-            Context::Impl { .. } => false,
-        });
+        let filtered: Vec<&InferredBound> = bounds
+            .iter()
+            .filter(|bound| match context {
+                Context::Trait { supertraits, .. } => {
+                    has_default && !has_bound(supertraits, bound)
+                }
+                Context::Impl { .. } => false,
+            })
+            .collect();
+
+        // When a diagnostic helper module is available (Send trait) and there are
+        // Send/Sync bounds to add, replace the raw `Send [+ Sync]` bounds with the
+        // helper trait so that `#[diagnostic::on_unimplemented]` fires with a more
+        // informative error message.
+        let needs_sync = filtered.iter().any(|b| matches!(b, InferredBound::Sync));
+        let predicate = if !filtered.is_empty() {
+            if let Some(helper_mod) = send_helper {
+                let helper_trait: Ident = if needs_sync {
+                    format_ident!("AsyncTraitSendSync")
+                } else {
+                    format_ident!("AsyncTraitSend")
+                };
+                parse_quote! { Self: self::#helper_mod::#helper_trait + 'async_trait }
+            } else {
+                parse_quote! { Self: #(#filtered +)* 'async_trait }
+            }
+        } else {
+            parse_quote! { Self: 'async_trait }
+        };
 
         where_clause_or_default(&mut sig.generics.where_clause)
             .predicates
-            .push(parse_quote! {
-                Self: #(#bounds +)* 'async_trait
-            });
+            .push(predicate);
     }
 
     for (i, arg) in sig.inputs.iter_mut().enumerate() {
