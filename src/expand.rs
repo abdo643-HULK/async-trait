@@ -581,6 +581,21 @@ fn transform_sig(
         }
     }
 
+    // Collect lifetimes from the allocator type, if any.  The allocator
+    // parameter is removed from sig.inputs before transform_sig runs (by
+    // extract_param_alloc), so its '_ tokens are missed by the loop above.
+    // Processing the type here ensures:
+    //   (a) '_ in the allocator type gets a stable 'life_N name in the
+    //       Box<…, AllocTy> output instead of staying as a raw '_,
+    //   (b) 'life_N: 'async_trait is added to the where clause,
+    //   (c) explicit lifetimes in the allocator type (e.g. 'a) are also
+    //       constrained via 'a: 'async_trait.
+    let alloc_ty_for_sig: Option<Type> = alloc.and_then(|a| a.ty()).map(|ty| {
+        let mut ty = ty.clone();
+        lifetimes.visit_type_mut(&mut ty);
+        ty
+    });
+
     for param in &mut sig.generics.params {
         match param {
             GenericParam::Type(param) => {
@@ -745,7 +760,7 @@ fn transform_sig(
     // Determine the allocator type token to use in the Box second type parameter.
     // `None` → omit the second parameter entirely (no allocator, or ExprOnly error-recovery).
     // `Some(tok)` → emit `, tok`.
-    let alloc_ty_tokens: Option<TokenStream> = alloc.and_then(|a| a.ty().map(|ty| quote!(#ty)));
+    let alloc_ty_tokens: Option<TokenStream> = alloc_ty_for_sig.as_ref().map(|ty| quote!(#ty));
 
     sig.output = match alloc_ty_tokens {
         None => parse_quote! {
